@@ -47,8 +47,9 @@ List defects identified in the starter implementation, how they were detected, a
 
 ### Tests Actually Passed
 
-- `.\.venv\Scripts\python.exe -m py_compile app\main.py tests\test_attendance_sprint2.py` completed successfully.
-- `.\.venv\Scripts\python.exe -m unittest discover -s tests -v`: 17 tests passed, 0 failed. The tests cover fixed-time punch-in/out responses, validation and conflicts, concurrently submitted requests, midnight/overnight calculations, rounding and thresholds, and attendance filtering/sorting/pagination.
+- `python -m py_compile app\main.py tests\test_attendance_sprint2.py` completed successfully.
+- `python -m unittest discover -s tests -v`: 17 tests passed, 0 failed in the Sprint 2 test run.
+- The tests cover fixed-time punch-in/out responses, validation and conflicts, concurrently submitted requests, midnight/overnight calculations, rounding and thresholds, and attendance filtering/sorting/pagination.
 - The tests use a thread-safe in-memory collection through FastAPI's test client. Each test replaces `main.db` with a fresh `FakeDatabase` and restores the original reference during teardown. The test records are not written to the development MongoDB database.
 - A controlled 09:30 IST punch-in with a 09:30 shift start returns `late_minutes: 0`; the reported `230` was not reproducible from that controlled input. Early-morning overnight attendance-date handling was separately covered and its redundant shift-date adjustment was removed.
 
@@ -58,16 +59,46 @@ List defects identified in the starter implementation, how they were detected, a
 - Threaded requests were exercised against an in-memory mock, not a MongoDB server. MongoDB unique-index and atomic-update race behavior is implemented but not integration-tested here.
 - Large-dataset query performance and live MongoDB index usage were not measured in the Sprint 2 test run.
 
-### Remaining Work
+## Sprint 3: Attendance Corrections and Audit History
 
-- Verify index usage for the required query patterns and evaluate performance against the assignment's large dataset.
-- Implement and verify the PATCH attendance-correction endpoint, including audit history and concurrency handling.
+### Implemented Behavior
+
+- Added `PATCH /attendance/{emp_code}/{attendance_date}` for attendance corrections.
+- Added request validation for permitted attendance statuses and punch timestamps.
+- Correction logic recalculates derived attendance fields when applicable.
+- Attendance records initialize an audit-history list, and corrections append history entries containing the correction timestamp and changed values.
+- The endpoint includes handling for missing employees and attendance records, and uses a conditional database update to protect against conflicting concurrent corrections.
+
+### Tests Actually Passed
+
+- `python -m unittest discover -s tests -p "test_attendance_sprint3.py" -v`: 39 tests passed, 0 failed.
+- `python -m unittest discover -s tests -v`: 56 tests passed, 0 failed in the latest reported full regression run.
+- Sprint 3 tests cover route registration, missing employee and attendance responses, invalid status validation, and a correction that recalculates overtime and creates an audit-history entry.
+- Sprint 3 tests inherit the Sprint 2 test class, so the targeted Sprint 3 test run also executes the inherited Sprint 2 tests.
+- Tests use an in-memory fake database. These results do not establish live MongoDB integration or concurrent correction behavior against a real MongoDB server.
+
+### Remaining Sprint 3 Verification
+
+- Add tests for omitted fields remaining unchanged and no-op corrections.
+- Verify `ABSENT` and `LEAVE` corrections clear punch values as required.
+- Verify punch-in date restrictions, punch-out ordering, and the 24-hour limit.
+- Verify that each correction records only the fields that actually changed.
+- Test conflicting concurrent corrections and ensure audit history is not lost.
+- Confirm error responses and audit-history output match the assignment contract.
+
+## Remaining Work
+
+- Complete Sprint 3 edge-case and audit-history verification.
 - Implement and verify the required analytics endpoints using MongoDB aggregation pipelines.
 - Implement and verify the admin explain endpoint and confirm index usage for its supported query patterns.
 - Revisit the MongoDB-unavailable health-check behavior and test the expected HTTP 503 response.
+- Verify index usage for all required query patterns and evaluate performance against the assignment's large dataset.
 - Run final regression tests and distinguish implemented fixes from fixes verified through tests.
 
-### Tests Not Yet Executed
+## Tests Not Yet Executed
 
-- No live MongoDB integration, existing-dataset/index validation, or 100,000-record performance test was run.
-- The previously recorded health-check unavailable-database test remains unverified.
+- No live MongoDB integration test has been reported for the Sprint 2 or Sprint 3 concurrent-update paths.
+- No 100,000-record performance test has been reported.
+- The MongoDB-unavailable health-check behavior remains unverified.
+- The full Sprint 3 correction edge-case suite remains incomplete.
+- The latest reported full regression run passed 56 tests with 0 failures. This does not establish that all assignment requirements have been implemented or verified.

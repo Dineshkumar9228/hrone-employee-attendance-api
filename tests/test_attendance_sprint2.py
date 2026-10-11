@@ -135,7 +135,11 @@ class FakeCollection:
         with self.lock:
             for row in self.documents:
                 if self.matches(row, query):
-                    row.update(copy.deepcopy(update["$set"]))
+                    for field, value in update.get("$set", {}).items():
+                        row[field] = copy.deepcopy(value)
+
+                    for field, value in update.get("$push", {}).items():
+                        row.setdefault(field, []).append(copy.deepcopy(value))
 
                     class Result:
                         matched_count = 1

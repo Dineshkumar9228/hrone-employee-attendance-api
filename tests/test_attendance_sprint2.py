@@ -2,7 +2,7 @@ import copy
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -54,6 +54,7 @@ class FakeCollection:
         self.documents = []
         self.lock = threading.RLock()
         self.next_id = 1
+        self.aggregate_pipelines = []
 
     def create_index(self, *_args, **_kwargs):
         return "fake_index"
@@ -135,6 +136,264 @@ class FakeCollection:
         with self.lock:
             return sum(self.matches(row, query) for row in self.documents)
 
+    def aggregate(self, pipeline):
+        self.aggregate_pipelines.append(copy.deepcopy(pipeline))
+        if len(pipeline) > 1 and "$lookup" in pipeline[1]:
+            return self.aggregate_department_summary(pipeline)
+        if any("$setWindowFields" in stage for stage in pipeline):
+            if "$rank" in str(pipeline):
+                return self.aggregate_late_leaderboard(pipeline)
+            return self.aggregate_department_trend(pipeline)
+
+        match = pipeline[0]["$match"]
+        with self.lock:
+            records = [
+                copy.deepcopy(row)
+                for row in self.documents
+                if self.matches(row, match)
+            ]
+        if not records:
+            return iter([])
+
+        present_days = 0
+        leave_days = 0
+        late_count = 0
+        total_late_minutes = 0
+        total_overtime_minutes = 0
+        for record in records:
+            weekday = datetime.fromisoformat(record["date"]).weekday()
+            status = record.get("status")
+            if status in {"PRESENT", "WFH", "ON_DUTY"} and weekday < 5:
+                present_days += 0.5 if record.get("half_day", False) else 1
+            leave_days += status == "LEAVE"
+            late_minutes = record.get("late_minutes", 0)
+            late_count += late_minutes > 0
+            total_late_minutes += late_minutes
+            total_overtime_minutes += record.get("overtime_minutes", 0)
+
+        return iter([{
+            "_id": None,
+            "present_days": present_days,
+            "leave_days": leave_days,
+            "late_count": late_count,
+            "total_late_minutes": total_late_minutes,
+            "total_overtime_minutes": total_overtime_minutes,
+        }])
+
+    def aggregate_late_leaderboard(self, pipeline):
+        date_range = pipeline[0]["$match"]["date"]
+        month_logs = [
+            record
+            for record in self.documents
+            if date_range["$gte"] <= record.get("date", "") <= date_range["$lte"]
+        ]
+        totals = {}
+        for record in month_logs:
+            code = record["emp_code"]
+            result = totals.setdefault(code, {"total": 0, "late_count": 0})
+            minutes = record.get("late_minutes", 0)
+            result["total"] += minutes
+            result["late_count"] += minutes > 0
+
+        employee_collection = self.employees
+        employee_by_code = {
+            employee["emp_code"]: employee
+            for employee in employee_collection.documents
+        }
+        department_filter = None
+        lookup = pipeline[3]["$lookup"]["pipeline"][0]["$match"]
+        if "$and" in lookup.get("$expr", {}):
+            department_filter = lookup["$expr"]["$and"][1]["$eq"][1]
+
+        ranked = []
+        for code, result in totals.items():
+            employee = employee_by_code.get(code)
+            if result["total"] <= 0 or employee is None:
+                continue
+            if department_filter is not None and employee["department"] != department_filter:
+                continue
+            ranked.append(
+                {
+                    "emp_code": code,
+                    "name": employee["name"],
+                    "department": employee["department"],
+                    "total_late_minutes": result["total"],
+                    "late_count": result["late_count"],
+                }
+            )
+        ranked.sort(key=lambda row: (-row["total_late_minutes"], row["emp_code"]))
+
+        rank_by_total = {}
+        for index, row in enumerate(ranked, start=1):
+            total = row["total_late_minutes"]
+            rank_by_total.setdefault(total, index)
+            row["rank"] = rank_by_total[total]
+        rank_limit = pipeline[6]["$match"]["rank"]["$lte"]
+        return iter([row for row in ranked if row["rank"] <= rank_limit])
+
+    def aggregate_department_trend(self, pipeline):
+        department = pipeline[0]["$match"]["department"]
+        day_count = pipeline[2]["$project"]["calendar"]["$map"]["input"]["$range"][1]
+        start_date = date.fromisoformat(
+            pipeline[2]["$project"]["calendar"]["$map"]["in"]["$dateAdd"]
+            ["startDate"]["$dateFromString"]["dateString"]
+        )
+        if hasattr(self, "employees"):
+            employee_collection = self.employees
+            attendance_collection = self
+        else:
+            employee_collection = self
+            attendance_collection = self.attendance_logs
+        with employee_collection.lock, attendance_collection.lock:
+            employees = copy.deepcopy(employee_collection.documents)
+            attendance_records = copy.deepcopy(attendance_collection.documents)
+
+        rows = []
+        for day_offset in range(day_count):
+            current_date = start_date + timedelta(days=day_offset)
+            day_string = current_date.isoformat()
+            active = [
+                employee
+                for employee in employees
+                if employee["department"] == department
+                and employee.get("joined_on", "9999-12-31") <= day_string
+            ]
+            active_codes = {employee["emp_code"] for employee in active}
+            records = [
+                record
+                for record in attendance_records
+                if record.get("emp_code") in active_codes
+                and record.get("date") == day_string
+            ]
+            present_count = sum(
+                0.5 if record.get("half_day", False) else 1
+                for record in records
+                if record.get("status") in {"PRESENT", "WFH", "ON_DUTY"}
+            )
+            late_count = sum(
+                record.get("late_minutes", 0) > 0
+                for record in records
+            )
+            working_day = current_date.weekday() < 5
+            headcount = sum(
+                employee.get("joined_on", "9999-12-31") <= day_string
+                for employee in employees
+                if employee["department"] == department
+            )
+            rate = None
+            if working_day and headcount > 0:
+                rate = round(present_count / headcount + 1e-12, 4)
+            rows.append(
+                {
+                    "date": day_string,
+                    "is_working_day": working_day,
+                    "headcount": headcount,
+                    "present_count": present_count,
+                    "late_count": late_count,
+                    "attendance_rate": rate,
+                }
+            )
+
+        for index, row in enumerate(rows):
+            values = [
+                item["attendance_rate"]
+                for item in rows[max(0, index - 6):index + 1]
+                if item["attendance_rate"] is not None
+            ]
+            row["moving_avg_7d"] = (
+                round(sum(values) / len(values) + 1e-12, 4)
+                if values
+                else None
+            )
+        return iter(rows)
+
+    def aggregate_department_summary(self, pipeline):
+        employee_match = pipeline[0]["$match"]
+        lookup_match = pipeline[1]["$lookup"]["pipeline"][0]["$match"]["$expr"]["$and"]
+        month_start = next(
+            clause["$gte"][1]
+            for clause in lookup_match
+            if "$gte" in clause
+        )
+        month_end = next(
+            clause["$lte"][1]
+            for clause in lookup_match
+            if "$lte" in clause
+        )
+        attendance_logs = self.attendance_logs
+        with self.lock, attendance_logs.lock:
+            employees = [
+                copy.deepcopy(employee)
+                for employee in self.documents
+                if self.matches(employee, employee_match)
+            ]
+            attendance_records = copy.deepcopy(attendance_logs.documents)
+
+        departments = {}
+        for employee in employees:
+            department = employee["department"]
+            totals = departments.setdefault(
+                department,
+                {
+                    "headcount": 0,
+                    "present_days": 0,
+                    "work_hours_sum": 0,
+                    "work_hours_count": 0,
+                    "late_count": 0,
+                    "total_late_minutes": 0,
+                    "leave_count": 0,
+                    "on_duty_count": 0,
+                },
+            )
+            totals["headcount"] += 1
+            records = [
+                record
+                for record in attendance_records
+                if record.get("emp_code") == employee.get("emp_code")
+                and month_start <= record.get("date", "") <= month_end
+            ]
+
+            for record in records:
+                status = record.get("status")
+                if (
+                    status in {"PRESENT", "WFH", "ON_DUTY"}
+                    and datetime.fromisoformat(record["date"]).weekday() < 5
+                ):
+                    totals["present_days"] += (
+                        0.5 if record.get("half_day", False) else 1
+                    )
+                work_hours = record.get("work_hours")
+                if (
+                    status in {"PRESENT", "WFH", "ON_DUTY"}
+                    and work_hours is not None
+                ):
+                    totals["work_hours_sum"] += work_hours
+                    totals["work_hours_count"] += 1
+                late_minutes = record.get("late_minutes", 0)
+                totals["late_count"] += late_minutes > 0
+                if late_minutes > 0:
+                    totals["total_late_minutes"] += late_minutes
+                totals["leave_count"] += status == "LEAVE"
+                totals["on_duty_count"] += status == "ON_DUTY"
+
+        results = []
+        for department, totals in sorted(departments.items()):
+            work_hours_count = totals.pop("work_hours_count")
+            work_hours_sum = totals.pop("work_hours_sum")
+            average = None
+            if work_hours_count:
+                average = int(
+                    work_hours_sum / work_hours_count * 100 + 0.5
+                ) / 100
+            results.append(
+                {
+                    "department": department,
+                    **totals,
+                    "avg_work_hours": average,
+                }
+            )
+        return iter(results)
+
     def update_one(self, query, update):
         with self.lock:
             for row in self.documents:
@@ -160,6 +419,17 @@ class FakeDatabase:
     def __init__(self):
         self.employees = FakeCollection()
         self.attendance_logs = FakeCollection()
+        self.employees.attendance_logs = self.attendance_logs
+        self.attendance_logs.employees = self.employees
+        self.commands = []
+
+    def command(self, command):
+        self.commands.append(copy.deepcopy(command))
+        return {
+            "ok": 1,
+            "queryPlanner": {"winningPlan": {"stage": "IXSCAN"}},
+            "executionStats": {"executionSuccess": True},
+        }
 
 
 class AttendanceSprint2Tests(unittest.TestCase):
@@ -173,13 +443,22 @@ class AttendanceSprint2Tests(unittest.TestCase):
         self.client.__exit__(None, None, None)
         main.db = self.original_db
 
-    def add_employee(self, emp_code="EMP0001", shift_start="09:30", shift_end="18:30"):
+    def add_employee(
+        self,
+        emp_code="EMP0001",
+        shift_start="09:30",
+        shift_end="18:30",
+        joined_on="2026-01-05",
+        department="Engineering",
+    ):
         main.db.employees.insert_one(
             {
                 "emp_code": emp_code,
                 "name": "Test Employee",
                 "shift_start": shift_start,
                 "shift_end": shift_end,
+                "joined_on": joined_on,
+                "department": department,
             }
         )
 

@@ -81,15 +81,61 @@ List defects identified in the starter implementation, how they were detected, a
 - Tests cover omitted fields, no-op corrections, absent/leave behavior and invalid combinations, timestamp type validation, IST and overnight attendance-date validation, punch-out ordering and the 24-hour boundary, exact audit contents and append behavior, missing resources, and concurrent corrections.
 - Every API test replaces `main.db` with a fresh in-memory fake database and restores the original reference during teardown. These tests do not write to the development MongoDB database.
 
-## Remaining Work
-
-- Sprint 3 contract behavior listed above is covered by unit tests. Its atomic concurrency behavior has not been integration-tested against a live MongoDB server.
-- Other assignment scope remains outside this Sprint 3 completion: the analytics endpoints and admin explain endpoint are still unimplemented in `app/main.py`.
-- Large-dataset performance/index usage and the MongoDB-unavailable startup/health-check behavior remain unverified.
-
-## Tests Not Yet Executed
+## Remaining Unverified
 
 - No live MongoDB integration test has been run for Sprint 2 or Sprint 3 concurrent updates.
 - No 100,000-record performance test has been run.
 - The MongoDB-unavailable health-check behavior remains unverified.
-- Analytics and admin explain requirements remain unimplemented and unverified.
+- Sprint 4 aggregations and execution plans have not been run against live MongoDB; index usage and 100,000-record performance remain unverified.
+
+## Sprint 4: Employee Monthly Analytics
+
+### Implemented Behavior
+
+- Added `GET /analytics/employees/{emp_code}/monthly` with required `month=YYYY-MM` validation, HTTP 404 for an unknown employee, and the `EmployeeMonthly` response fields from `openapi.yaml`.
+- Uses an indexed employee/date range `$match` and a MongoDB `$group` aggregation over stored attendance values. The aggregation counts presence only on weekdays, applies the stored half-day flag as 0.5, and returns leave, late, and overtime totals; missing derived values default to zero.
+- Counts Monday-Friday working days inclusively from the later of the month's first day and the employee's `joined_on`. `attendance_pct` uses half-up rounding to two decimals and is `null` when working days are zero.
+
+### Tests Actually Passed
+
+- Tests use the existing in-memory fake database and verify route registration, response fields, the month-filtered aggregation query, weekday and weekend handling, half-day weighting, missing derived values, leave/late/overtime totals, mid-month join dates, zero-working-day behavior, invalid/missing months, and the unknown-employee 404 response.
+- `python -m unittest discover -s tests -p "test_attendance_sprint4.py" -v`: 40 tests passed, 0 failed; this includes the inherited Sprint 2 tests.
+- `python -m unittest discover -s tests -v`: 110 tests passed, 0 failed.
+- `python -m py_compile app\main.py tests\test_attendance_sprint2.py tests\test_attendance_sprint3.py tests\test_attendance_sprint4.py` and `git diff --check` completed successfully.
+- The in-memory fake validates the endpoint's aggregation behavior; this does not establish execution of the pipeline against a live MongoDB server or measured index use at scale.
+
+## Sprint 4: Department Summary
+
+### Implemented Behavior
+
+- Added `GET /analytics/departments/summary` with required `month=YYYY-MM`, optional exact-match `department`, and the documented `{month, items}` response shape.
+- Uses an `employees` aggregation with a month-bounded `$lookup` into `attendance_logs`, then groups employees before departments. The employee `$match` uses `joined_on <= month_end`; `$unwind` preserves employees with no logs, and future joiners are excluded.
+- Aggregates weekday presence with half-day weighting; averages work hours over present-status records that have stored work hours (across records, not per-employee averages); and computes late, leave, and on-duty counts as documented. The average uses half-up rounding to two decimals. Items are sorted by department.
+
+### Tests Actually Passed
+
+- In-memory tests cover normal results and response shape, exact case-sensitive department filtering, no-log employees and null averages, future join-date exclusion, invalid/missing month input, and the constructed `$lookup` date range.
+- The normal case distinguishes record-based averaging from per-employee averaging and confirms weekend records contribute to late totals but not weekday present days.
+- A dedicated case verifies the average work-hours half-up rounding boundary.
+- `python -m unittest discover -s tests -p "test_attendance_sprint4.py" -v`: 64 tests passed, 0 failed.
+- `python -m unittest discover -s tests -v`: 134 tests passed, 0 failed.
+- `python -m py_compile app\main.py tests\test_attendance_sprint2.py tests\test_attendance_sprint4.py` and `git diff --check` completed successfully.
+- The tests run against the in-memory fake; execution against live MongoDB and index behavior at scale remain unverified.
+
+## Sprint 4: Late Leaderboard, Department Trend, and Admin Explain
+
+### Implemented Behavior
+
+- Added `GET /analytics/leaderboard/late`. It validates `month=YYYY-MM`, applies the optional exact-match department filter and `limit` from 1 to 50 (default 10), aggregates monthly late totals/counts in MongoDB, joins employee metadata, and uses `$rank` competition ranking. The cutoff is applied after ranking, preserving every employee tied at an included rank.
+- Added `GET /analytics/departments/{department}/trend`. It validates ISO calendar dates, rejects reversed or over-92-day inclusive ranges with 422, returns 404 when no employee belongs to the department, and builds a continuous daily series in the MongoDB aggregation. Headcount uses `joined_on`; non-working days and zero-headcount rates are `null`; working days without records have rate `0.0`. The moving average uses the current row plus up to six preceding rows in the requested range and averages non-null rates, including partial windows at the range start.
+- Added `GET /admin/explain/{endpoint}` for the five endpoint identifiers in `openapi.yaml`. It validates required parameters and runs the matching MongoDB `find` or aggregation command with `executionStats`, preserving endpoint filters, sorting, pagination, and projection. Employee monthly, department summary, leaderboard, and trend use the same aggregation builders as their production routes. The response is `{endpoint, collection, explain}` with MongoDB BSON values serialized as JSON.
+- Added an idempotent `joined_on` employee index to support the department-summary join-date match in the explained aggregation.
+- Extended the in-memory fake aggregation and command support for isolated tests; tests do not connect to or modify development MongoDB data.
+
+### Tests Actually Passed
+
+- In-memory tests cover competition ranks, multi-record monthly totals, tied cutoff inclusion, exact department filtering, month/limit validation, daily gap filling, partial moving-average windows, zero-attendance and zero-headcount behavior, unknown departments, date ordering and inclusive 92-day limits, supported explain endpoints, execution-stats verbosity, required/invalid explain parameters, and matching full monthly/department-summary pipelines.
+- `python -m unittest discover -s tests -p "test_attendance_sprint4.py" -v`: 134 tests passed, 0 failed.
+- `python -m unittest discover -s tests -v`: 204 tests passed, 0 failed.
+- `python -m py_compile app\main.py tests\test_attendance_sprint2.py tests\test_attendance_sprint3.py tests\test_attendance_sprint4.py` and `git diff --check` completed successfully.
+- Live MongoDB execution and measured explain plans/index usage remain unverified; the unit tests assert the explain command and use an in-memory command stub.

@@ -1598,21 +1598,37 @@ def explain_endpoint(
     }
 
 
-@app.patch("/attendance/{emp_code}/{attendance_date}")
-def correct_attendance(
+@app.patch(
+    "/attendance/{emp_code}/{attendance_date}",
+    include_in_schema=False,
+)
+def correct_attendance_legacy(
     emp_code: str,
     attendance_date: str,
     body: AttendanceCorrectionIn,
 ):
+    return correct_attendance(
+        emp_code=emp_code,
+        date=attendance_date,
+        body=body,
+    )
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def correct_attendance(
+    emp_code: str,
+    date: str,
+    body: AttendanceCorrectionIn,
+):
     # Validate the attendance date.
     try:
-        parsed_date = date.fromisoformat(attendance_date)
-        if parsed_date.isoformat() != attendance_date:
+        parsed_date = datetime.strptime(date, "%Y-%m-%d").date()
+        if parsed_date.isoformat() != date:
             raise ValueError
     except ValueError:
         raise HTTPException(
             status_code=422,
-            detail="attendance_date must be a valid YYYY-MM-DD date",
+            detail="date must be a valid YYYY-MM-DD date",
         )
 
     employee = db.employees.find_one({"emp_code": emp_code})
@@ -1620,7 +1636,7 @@ def correct_attendance(
         raise HTTPException(status_code=404, detail="Employee not found")
 
     record = db.attendance_logs.find_one(
-        {"emp_code": emp_code, "date": attendance_date}
+        {"emp_code": emp_code, "date": date}
     )
     if record is None:
         raise HTTPException(status_code=404, detail="Attendance record not found")
@@ -1670,7 +1686,7 @@ def correct_attendance(
         shift_end = datetime.strptime(employee["shift_end"], "%H:%M").time()
         if shift_end <= shift_start and punch_in_ist.time() < shift_end:
             punch_in_date -= timedelta(days=1)
-        if punch_in_date.isoformat() != attendance_date:
+        if punch_in_date.isoformat() != date:
             raise HTTPException(
                 status_code=422,
                 detail="punch_in must fall on the attendance date in IST",
@@ -1708,7 +1724,7 @@ def correct_attendance(
             new_values["punch_in"],
             employee["shift_start"],
             employee["shift_end"],
-            attendance_date,
+            date,
         )
 
         if new_values["punch_out"] is not None:
@@ -1720,7 +1736,7 @@ def correct_attendance(
                 new_values["punch_out"],
                 employee["shift_start"],
                 employee["shift_end"],
-                attendance_date,
+                date,
             )
             new_values["half_day"] = new_values["work_hours"] < 4.50
         else:

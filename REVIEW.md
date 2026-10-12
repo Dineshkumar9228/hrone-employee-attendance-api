@@ -10,6 +10,9 @@ List defects identified in the starter implementation, how they were detected, a
 | 2 | Attendance work-hour calculation | Ordinary floating-point rounding can produce results inconsistent with the required decimal half-up rounding. | Test durations at half-cent rounding boundaries and compare the rounded work hours with the expected result. | Used decimal arithmetic with `ROUND_HALF_UP`; verified the behavior with Sprint 2 tests. |
 | 3 | Attendance half-day calculation | Determining half-day status before rounding can disagree with the required threshold based on rounded work hours. | Test a duration whose rounded work hours fall on the 4.50-hour threshold. | Calculate half-day status from the rounded work-hours value and test the threshold. |
 | 4 | Attendance punch-out | Updating a record without an atomic eligibility check can allow concurrent requests to close the same open attendance record inconsistently. | Submit concurrent punch-out requests and verify that only one succeeds. | Use an atomic conditional update; a request that loses the race returns HTTP 409. The threaded test uses an in-memory mock, not a live MongoDB integration test. |
+| 5 | Sprint 3 correction request and history | The correction request omitted the required `reason` and `regularized_by` fields, and history entries did not match the documented `{at, by, reason, changes}` shape or `{from, to}` values. | Send a schema-valid correction and compare the returned history entry with `openapi.yaml`. | Added the documented request constraints and emit the specified history fields with only actual changes. |
+| 6 | Sprint 3 overnight punch-in validation | Validation compared the punch-in's IST calendar date directly with the record date, rejecting early-morning punches that belong to the previous overnight shift date. | Correct an overnight-shift record for 2026-01-05 with a 05:30 IST punch-in on 2026-01-06. | Apply the overnight shift-date rule when validating the corrected punch-in. |
+| 7 | Sprint 3 conditional update for seeded records | The concurrency guard required `history: []`, so a seeded record with no `history` field could not be corrected despite the contract allowing omitted history. | Correct a fake-database seed record after removing its `history` field. | Match the history field's absence explicitly; MongoDB's atomic `$push` creates the array while retaining the compare-and-set guard. |
 
 **Review scope note:** The table above records issues identified in the available implementation and test history. It is not a claim that every line of the original starter file has been audited. Add further rows only when the original defect, reproduction case, and fix have been verified.
 
@@ -64,41 +67,29 @@ List defects identified in the starter implementation, how they were detected, a
 ### Implemented Behavior
 
 - Added `PATCH /attendance/{emp_code}/{attendance_date}` for attendance corrections.
-- Added request validation for permitted attendance statuses and punch timestamps.
-- Correction logic recalculates derived attendance fields when applicable.
-- Attendance records initialize an audit-history list, and corrections append history entries containing the correction timestamp and changed values.
-- The endpoint includes handling for missing employees and attendance records, and uses a conditional database update to protect against conflicting concurrent corrections.
+- Enforces the OpenAPI request requirements for `reason` and `regularized_by`, the permitted statuses, and epoch-millisecond punch timestamps. Unknown employees or missing attendance records return 404; invalid dates, invalid combinations, no-op corrections, and invalid punch times return 422.
+- Omitted correction fields remain unchanged. `ABSENT` and `LEAVE` clear both punch times and reset derived values; presence statuses require a punch-in on the record's attendance date, including the overnight-shift date rule. Punch-out must be after punch-in and no more than 24 hours later.
+- Recomputes derived fields and appends one `{at, by, reason, changes}` entry. `changes` uses `{from, to}` and includes only fields whose stored values changed. Existing history is retained, including records whose seeded history field was absent.
+- Uses a compare-and-set update and returns 409 to a concurrent correction that loses the race.
 
 ### Tests Actually Passed
 
-- `python -m unittest discover -s tests -p "test_attendance_sprint3.py" -v`: 39 tests passed, 0 failed.
-- `python -m unittest discover -s tests -v`: 56 tests passed, 0 failed in the latest reported full regression run.
-- Sprint 3 tests cover route registration, missing employee and attendance responses, invalid status validation, and a correction that recalculates overtime and creates an audit-history entry.
-- Sprint 3 tests inherit the Sprint 2 test class, so the targeted Sprint 3 test run also executes the inherited Sprint 2 tests.
-- Tests use an in-memory fake database. These results do not establish live MongoDB integration or concurrent correction behavior against a real MongoDB server.
-
-### Remaining Sprint 3 Verification
-
-- Add tests for omitted fields remaining unchanged and no-op corrections.
-- Verify `ABSENT` and `LEAVE` corrections clear punch values as required.
-- Verify punch-in date restrictions, punch-out ordering, and the 24-hour limit.
-- Verify that each correction records only the fields that actually changed.
-- Test conflicting concurrent corrections and ensure audit history is not lost.
-- Confirm error responses and audit-history output match the assignment contract.
+- `python -m unittest discover -s tests -p "test_attendance_sprint3.py" -v`: 53 tests passed, 0 failed. This includes inherited Sprint 2 cases.
+- `python -m unittest discover -s tests -v`: 70 tests passed, 0 failed.
+- `python -m py_compile app\main.py tests\test_attendance_sprint2.py tests\test_attendance_sprint3.py` completed successfully.
+- `git diff --check` completed successfully before this documentation update; it was rerun after the update.
+- Tests cover omitted fields, no-op corrections, absent/leave behavior and invalid combinations, timestamp type validation, IST and overnight attendance-date validation, punch-out ordering and the 24-hour boundary, exact audit contents and append behavior, missing resources, and concurrent corrections.
+- Every API test replaces `main.db` with a fresh in-memory fake database and restores the original reference during teardown. These tests do not write to the development MongoDB database.
 
 ## Remaining Work
 
-- Complete Sprint 3 edge-case and audit-history verification.
-- Implement and verify the required analytics endpoints using MongoDB aggregation pipelines.
-- Implement and verify the admin explain endpoint and confirm index usage for its supported query patterns.
-- Revisit the MongoDB-unavailable health-check behavior and test the expected HTTP 503 response.
-- Verify index usage for all required query patterns and evaluate performance against the assignment's large dataset.
-- Run final regression tests and distinguish implemented fixes from fixes verified through tests.
+- Sprint 3 contract behavior listed above is covered by unit tests. Its atomic concurrency behavior has not been integration-tested against a live MongoDB server.
+- Other assignment scope remains outside this Sprint 3 completion: the analytics endpoints and admin explain endpoint are still unimplemented in `app/main.py`.
+- Large-dataset performance/index usage and the MongoDB-unavailable startup/health-check behavior remain unverified.
 
 ## Tests Not Yet Executed
 
-- No live MongoDB integration test has been reported for the Sprint 2 or Sprint 3 concurrent-update paths.
-- No 100,000-record performance test has been reported.
+- No live MongoDB integration test has been run for Sprint 2 or Sprint 3 concurrent updates.
+- No 100,000-record performance test has been run.
 - The MongoDB-unavailable health-check behavior remains unverified.
-- The full Sprint 3 correction edge-case suite remains incomplete.
-- The latest reported full regression run passed 56 tests with 0 failures. This does not establish that all assignment requirements have been implemented or verified.
+- Analytics and admin explain requirements remain unimplemented and unverified.

@@ -14,7 +14,7 @@ from typing import Optional
 from decimal import Decimal, ROUND_HALF_UP
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 
@@ -238,16 +238,18 @@ class PunchOutIn(BaseModel):
 
 class AttendanceCorrectionIn(BaseModel):
     status: Optional[str] = None
-    punch_in: Optional[int] = Field(
+    punch_in: Optional[StrictInt] = Field(
         default=None,
         ge=100000000000,
         le=4102444800000,
     )
-    punch_out: Optional[int] = Field(
+    punch_out: Optional[StrictInt] = Field(
         default=None,
         ge=100000000000,
         le=4102444800000,
     )
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
 
     @field_validator("status")
     @classmethod
@@ -256,6 +258,13 @@ class AttendanceCorrectionIn(BaseModel):
             "PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"
         }:
             raise ValueError("Invalid attendance status")
+        return value
+
+    @field_validator("punch_in", "punch_out", mode="before")
+    @classmethod
+    def validate_supplied_punch_timestamp(cls, value):
+        if value is None:
+            raise ValueError("Punch timestamps must be epoch milliseconds")
         return value
 
 # --------------------------------------------------------------------------- #
@@ -598,9 +607,7 @@ def correct_attendance(
     new_status = body.status if "status" in supplied else old_status
 
     if new_status in {"ABSENT", "LEAVE"}:
-        if ("punch_in" in supplied and body.punch_in is not None) or (
-            "punch_out" in supplied and body.punch_out is not None
-        ):
+        if "punch_in" in supplied or "punch_out" in supplied:
             raise HTTPException(
                 status_code=422,
                 detail="ABSENT and LEAVE cannot have punch timestamps",
@@ -632,7 +639,15 @@ def correct_attendance(
                 detail="Presence statuses require punch_in",
             )
 
-        if new_punch_in.astimezone(IST).date().isoformat() != attendance_date:
+        punch_in_ist = new_punch_in.astimezone(IST)
+        punch_in_date = punch_in_ist.date()
+        shift_start = datetime.strptime(
+            employee["shift_start"], "%H:%M"
+        ).time()
+        shift_end = datetime.strptime(employee["shift_end"], "%H:%M").time()
+        if shift_end <= shift_start and punch_in_ist.time() < shift_end:
+            punch_in_date -= timedelta(days=1)
+        if punch_in_date.isoformat() != attendance_date:
             raise HTTPException(
                 status_code=422,
                 detail="punch_in must fall on the attendance date in IST",
@@ -697,12 +712,12 @@ def correct_attendance(
             old_value = normalize_utc(old_value)
         if old_value != new_value:
             changed[field] = {
-                "old": (
+                "from": (
                     to_epoch_milliseconds(old_value)
                     if field in {"punch_in", "punch_out"} and old_value is not None
                     else old_value
                 ),
-                "new": (
+                "to": (
                     to_epoch_milliseconds(new_value)
                     if field in {"punch_in", "punch_out"} and new_value is not None
                     else new_value
@@ -713,7 +728,9 @@ def correct_attendance(
         raise HTTPException(status_code=422, detail="No changes supplied")
 
     history_entry = {
-        "changed_at": utc_now(),
+        "at": utc_now(),
+        "by": body.regularized_by,
+        "reason": body.reason,
         "changes": changed,
     }
 
@@ -721,8 +738,11 @@ def correct_attendance(
     condition = {
         "_id": record["_id"],
         "status": old_status,
-        "history": record.get("history", []),
     }
+    if "history" in record:
+        condition["history"] = record["history"]
+    else:
+        condition["history"] = {"$exists": False}
     for field in ("punch_in", "punch_out", "late_minutes", "work_hours",
                   "overtime_minutes", "half_day"):
         condition[field] = record.get(field)
@@ -753,8 +773,8 @@ def correct_attendance(
             )
 
     for entry in updated_record.get("history", []):
-        if isinstance(entry.get("changed_at"), datetime):
-            entry["changed_at"] = to_epoch_milliseconds(entry["changed_at"])
+        if isinstance(entry.get("at"), datetime):
+            entry["at"] = to_epoch_milliseconds(entry["at"])
 
     return updated_record
 

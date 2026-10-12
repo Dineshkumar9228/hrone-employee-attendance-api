@@ -64,6 +64,10 @@ class FakeCollection:
             actual = document.get(field)
             if isinstance(expected, dict):
                 for operator, value in expected.items():
+                    if operator == "$exists":
+                        if (field in document) != value:
+                            return False
+                        continue
                     if actual is None and operator != "$ne":
                         return False
                     if operator == "$lte" and not actual <= value:

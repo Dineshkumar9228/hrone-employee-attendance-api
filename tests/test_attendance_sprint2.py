@@ -3,6 +3,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -233,10 +234,17 @@ class FakeCollection:
 
     def aggregate_department_trend(self, pipeline):
         department = pipeline[0]["$match"]["department"]
-        day_count = pipeline[2]["$project"]["calendar"]["$map"]["input"]["$range"][1]
+        calendar_pipeline = pipeline[1]["$facet"]["calendar"]
+        calendar_project = next(
+            stage["$project"]
+            for stage in calendar_pipeline
+            if "$project" in stage and "calendar" in stage["$project"]
+        )
+        calendar_map = calendar_project["calendar"]["$map"]
+        day_count = calendar_map["input"]["$range"][1]
         start_date = date.fromisoformat(
-            pipeline[2]["$project"]["calendar"]["$map"]["in"]["$dateAdd"]
-            ["startDate"]["$dateFromString"]["dateString"]
+            calendar_map["in"]["$dateAdd"]["startDate"]["$dateFromString"]
+            ["dateString"]
         )
         if hasattr(self, "employees"):
             employee_collection = self.employees
@@ -249,20 +257,21 @@ class FakeCollection:
             attendance_records = copy.deepcopy(attendance_collection.documents)
 
         rows = []
+        department_employees = [
+            employee
+            for employee in employees
+            if employee["department"] == department
+        ]
+        department_codes = {
+            employee["emp_code"] for employee in department_employees
+        }
         for day_offset in range(day_count):
             current_date = start_date + timedelta(days=day_offset)
             day_string = current_date.isoformat()
-            active = [
-                employee
-                for employee in employees
-                if employee["department"] == department
-                and employee.get("joined_on", "9999-12-31") <= day_string
-            ]
-            active_codes = {employee["emp_code"] for employee in active}
             records = [
                 record
                 for record in attendance_records
-                if record.get("emp_code") in active_codes
+                if record.get("emp_code") in department_codes
                 and record.get("date") == day_string
             ]
             present_count = sum(
@@ -277,8 +286,7 @@ class FakeCollection:
             working_day = current_date.weekday() < 5
             headcount = sum(
                 employee.get("joined_on", "9999-12-31") <= day_string
-                for employee in employees
-                if employee["department"] == department
+                for employee in department_employees
             )
             rate = None
             if working_day and headcount > 0:
@@ -309,17 +317,19 @@ class FakeCollection:
 
     def aggregate_department_summary(self, pipeline):
         employee_match = pipeline[0]["$match"]
-        lookup_match = pipeline[1]["$lookup"]["pipeline"][0]["$match"]["$expr"]["$and"]
-        month_start = next(
-            clause["$gte"][1]
-            for clause in lookup_match
-            if "$gte" in clause
-        )
-        month_end = next(
-            clause["$lte"][1]
-            for clause in lookup_match
-            if "$lte" in clause
-        )
+        lookup = pipeline[1]["$lookup"]
+        lookup_match = lookup["pipeline"][0]["$match"]
+        if "date" in lookup_match:
+            month_start = lookup_match["date"]["$gte"]
+            month_end = lookup_match["date"]["$lte"]
+        else:
+            clauses = lookup_match["$expr"]["$and"]
+            month_start = next(
+                clause["$gte"][1] for clause in clauses if "$gte" in clause
+            )
+            month_end = next(
+                clause["$lte"][1] for clause in clauses if "$lte" in clause
+            )
         attendance_logs = self.attendance_logs
         with self.lock, attendance_logs.lock:
             employees = [
@@ -367,7 +377,7 @@ class FakeCollection:
                     status in {"PRESENT", "WFH", "ON_DUTY"}
                     and work_hours is not None
                 ):
-                    totals["work_hours_sum"] += work_hours
+                    totals["work_hours_sum"] += Decimal(str(work_hours))
                     totals["work_hours_count"] += 1
                 late_minutes = record.get("late_minutes", 0)
                 totals["late_count"] += late_minutes > 0
@@ -382,9 +392,12 @@ class FakeCollection:
             work_hours_sum = totals.pop("work_hours_sum")
             average = None
             if work_hours_count:
-                average = int(
-                    work_hours_sum / work_hours_count * 100 + 0.5
-                ) / 100
+                average = float(
+                    (work_hours_sum / work_hours_count).quantize(
+                        Decimal("0.01"),
+                        rounding=ROUND_HALF_UP,
+                    )
+                )
             results.append(
                 {
                     "department": department,
@@ -488,6 +501,26 @@ class AttendanceSprint2Tests(unittest.TestCase):
         self.assertEqual(body["punch_in"], epoch_ms(at_ist(5, 9, 30)))
         self.assertEqual(body["late_minutes"], 0)
         self.assertIsNone(body["punch_out"])
+        self.assertNotIn("id", body)
+        self.assertNotIn("_id", body)
+
+    def test_punch_endpoints_reject_coercible_non_integer_timestamps(self):
+        self.add_employee()
+        for value in (
+            str(epoch_ms(at_ist(5, 9, 30))),
+            float(epoch_ms(at_ist(5, 9, 30))),
+        ):
+            with self.subTest(value=value):
+                punch_in = self.client.post(
+                    "/attendance/punch-in",
+                    json={"emp_code": "EMP0001", "punched_at": value},
+                )
+                punch_out = self.client.post(
+                    "/attendance/punch-out",
+                    json={"emp_code": "EMP0001", "punched_at": value},
+                )
+                self.assertEqual(punch_in.status_code, 422)
+                self.assertEqual(punch_out.status_code, 422)
 
     def test_punch_in_uses_current_utc_when_timestamp_is_omitted(self):
         self.add_employee()
@@ -748,6 +781,10 @@ class AttendanceSprint2Tests(unittest.TestCase):
         )
         self.assertEqual(
             self.client.get("/attendance", params={"page_size": 0}).status_code,
+            422,
+        )
+        self.assertEqual(
+            self.client.get("/attendance", params={"status": "UNKNOWN"}).status_code,
             422,
         )
 

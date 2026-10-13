@@ -1,8 +1,9 @@
 # REVIEW.md
 
-## Defect Review — Starter `app/main.py`
+## Verified Defect Review
 
-List defects identified in the starter implementation, how they were detected, and how they were fixed.
+Rows 1-7 record the starter defects traced in the original implementation. Rows 8-13 record additional contract and
+performance defects reproduced during follow-up review, with their fixes and verification evidence.
 
 | # | Where (function / line) | What is wrong | How you'd notice it (test, input, or symptom) | How you fixed it |
 |---|---|---|---|---|
@@ -13,8 +14,14 @@ List defects identified in the starter implementation, how they were detected, a
 | 5 | Sprint 3 correction request and history | The correction request omitted the required `reason` and `regularized_by` fields, and history entries did not match the documented `{at, by, reason, changes}` shape or `{from, to}` values. | Send a schema-valid correction and compare the returned history entry with `openapi.yaml`. | Added the documented request constraints and emit the specified history fields with only actual changes. |
 | 6 | Sprint 3 overnight punch-in validation | Validation compared the punch-in's IST calendar date directly with the record date, rejecting early-morning punches that belong to the previous overnight shift date. | Correct an overnight-shift record for 2026-01-05 with a 05:30 IST punch-in on 2026-01-06. | Apply the overnight shift-date rule when validating the corrected punch-in. |
 | 7 | Sprint 3 conditional update for seeded records | The concurrency guard required `history: []`, so a seeded record with no `history` field could not be corrected despite the contract allowing omitted history. | Correct a fake-database seed record after removing its `history` field. | Match the history field's absence explicitly; MongoDB's atomic `$push` creates the array while retaining the compare-and-set guard. |
+| 8 | Punch-in and punch-out timestamp models | Pydantic's non-strict `int` accepted an epoch timestamp encoded as a string or integral float, despite the contract requiring an integer JSON value. | Validate `"1783312500000"` and `1783312500000.0` against both request models; both were accepted before the fix. | Changed both fields to `StrictInt` and added HTTP 422 regression tests for both endpoints. |
+| 9 | Punch-in response | The response added an `id` string copied from MongoDB's inserted `_id`, although the attendance response schema and conventions exclude database identifiers. | Compare a successful punch-in response with `AttendanceRecord`; it included an undeclared `id`. | Return the attendance fields only; added assertions that neither `id` nor `_id` is exposed. |
+| 10 | Attendance-list status parameter | The route accepted arbitrary status strings, while the OpenAPI contract restricts this parameter to the five `Status` values. | Request `/attendance?status=UNKNOWN`; it returned an empty success response before the fix. | Typed the query as the documented `Literal` and added a 422 regression assertion. |
+| 11 | Department-summary attendance lookup | The lookup expressed both the employee-code equality and literal month bounds inside `$expr`. A focused A/B probe on the 5,000-employee/100,000-record benchmark database returned identical rows but measured 6.539/7.118 s for the original form versus 5.402/4.977 s for a direct equality join and date match. | Compare both aggregation results and timings on `hrone_attendance_perf_20261013`; the paired timings favor the direct form, but require a repeatable final benchmark. | Use `localField`/`foreignField` for `emp_code` and a direct inclusive `date` range predicate. The existing unique `(emp_code, date)` index remains in use; no index was added. |
+| 12 | Department-trend repeated lookups | The prior pipeline performed a headcount lookup per day and an attendance lookup per day that joined each attendance row back to employees. On the benchmark dataset, the previous pipeline took 29.644 s; the revised pipeline took 0.979/1.027/0.975 s and returned rows exactly equal to the previous output. | Run both pipeline versions for Engineering, 2026-01-01 through 2026-01-20, and compare the 20 output rows and elapsed times. | Compute headcount and attendance event arrays once per department in a `$facet`, join attendance from department employees through the existing employee-code index, and retain the calendar and moving-window calculations. Repeat the benchmark before treating these measurements as final. |
+| 13 | Department-summary average rounding | Rounding an average in binary floating-point could turn the exact decimal midpoint `1.005` into `1.00` instead of half-up `1.01`. A MongoDB expression using the old formula reproduced this result for `1.00` and `1.01`. | Exercise that midpoint in the live MongoDB expression and in the focused summary regression test. | Sum work-hour values as Decimal128, perform the average and half-up rounding in decimal arithmetic, and convert only the final rounded result to double. |
 
-**Review scope note:** The table above records issues identified in the available implementation and test history. It is not a claim that every line of the original starter file has been audited. Add further rows only when the original defect, reproduction case, and fix have been verified.
+**Review scope note:** The table records thirteen verified defects and their fixes; it is not a claim that every line of the original starter file has been audited. Add further rows only when the defect, reproduction case, and fix have been verified.
 
 ## Items Reviewed but Not Classified as Defects
 
@@ -138,4 +145,14 @@ List defects identified in the starter implementation, how they were detected, a
 - `python -m unittest discover -s tests -p "test_attendance_sprint4.py" -v`: 134 tests passed, 0 failed.
 - `python -m unittest discover -s tests -v`: 204 tests passed, 0 failed.
 - `python -m py_compile app\main.py tests\test_attendance_sprint2.py tests\test_attendance_sprint3.py tests\test_attendance_sprint4.py` and `git diff --check` completed successfully.
-- Live MongoDB execution and measured explain plans/index usage remain unverified; the unit tests assert the explain command and use an in-memory command stub.
+- Those earlier unit-test runs used an in-memory fake; live MongoDB execution and measured explain plans/index usage were not verified by those runs.
+
+## Follow-up Verification — 13 October 2026
+
+- Ran focused unittest cases covering punch timestamp strictness and response fields, attendance status validation and pagination, IST/overnight behavior, grace/overtime/half-day/rounding boundaries, department summary headcount and aggregation behavior, department trend rows and moving averages, and explain-pipeline construction: **20 passed, 0 failed**.
+- Compared the 12 path/method pairs in `openapi.yaml` with FastAPI's generated OpenAPI map: the sets match exactly. Examples and response schemas were reviewed against the endpoint behavior; the timestamp and punch-in response mismatches recorded above were corrected.
+- On the read-only `hrone_attendance_perf_20261013` database (5,000 employees, 100,000 attendance records), MongoDB 8.2.1 explain output for attendance listing, employee monthly, department summary, leaderboard, and department trend reported zero collection scans. The observed indexes were `idx_attendance_date_code`, `uq_attendance_employee_date`, `idx_employee_joined_on`, `uq_employee_emp_code`, and `idx_employee_department_code` as applicable. No indexes were created or dropped.
+- The department-summary A/B probe returned identical rows; the direct equality/date-range lookup was faster in two paired runs (6.539/7.118 s for the existing form; 5.402/4.977 s for the candidate). These preliminary measurements are not a final benchmark.
+- The decimal summary expression returned 1.01 for a synthetic average of 1.00 and 1.01, and the complete aggregation returned the expected five departments and 9.0 average hours on the benchmark dataset. The Decimal128 change was made after the A/B timing probe, so the final combined summary pipeline still needs a benchmark.
+- The trend comparison returned identical 20-row output; measured 29.644 s for the previous pipeline and 0.979/1.027/0.975 s for the revised pipeline. Repeat with the full benchmark procedure before treating this as the final performance result.
+- Final benchmark, full regression suite, and human Git review remain manual verification steps.

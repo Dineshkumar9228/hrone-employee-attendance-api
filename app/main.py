@@ -219,7 +219,7 @@ class EmployeeIn(BaseModel):
 
 class PunchInIn(BaseModel):
     emp_code: str = Field(min_length=1, max_length=20)
-    punched_at: Optional[int] = Field(
+    punched_at: Optional[StrictInt] = Field(
         default=None,
         ge=100000000000,
         le=4102444800000,
@@ -238,7 +238,7 @@ class PunchOutIn(BaseModel):
         min_length=1,
         max_length=20
     )
-    punched_at: Optional[int] = Field(
+    punched_at: Optional[StrictInt] = Field(
         default=None,
         ge=100000000000,
         le=4102444800000
@@ -392,14 +392,13 @@ def punch_in(body: PunchInIn):
     }
 
     try:
-        result = db.attendance_logs.insert_one(doc)
+        db.attendance_logs.insert_one(doc)
     except DuplicateKeyError:
         raise HTTPException(
             status_code=409,
             detail="Already punched in for this attendance date",
         )
 
-    doc["id"] = str(result.inserted_id)
     doc.pop("_id", None)
 
     # Return timestamps as epoch milliseconds.
@@ -517,7 +516,9 @@ def list_attendance(
     emp_code: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    status: Optional[str] = None,
+    status: Optional[
+        Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
+    ] = None,
     page: int = 1,
     page_size: int = 20,
 ):
@@ -664,6 +665,22 @@ def _employee_monthly_pipeline(
     ]
 
 
+@app.patch(
+    "/attendance/{emp_code}/{attendance_date}",
+    include_in_schema=False,
+)
+def correct_attendance_legacy(
+    emp_code: str,
+    attendance_date: str,
+    body: AttendanceCorrectionIn,
+):
+    return correct_attendance(
+        emp_code=emp_code,
+        date=attendance_date,
+        body=body,
+    )
+
+
 @app.get("/analytics/employees/{emp_code}/monthly")
 def employee_monthly(emp_code: str, month: str):
     if re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month) is None:
@@ -732,26 +749,14 @@ def _department_summary_pipeline(
         {
             "$lookup": {
                 "from": "attendance_logs",
-                "let": {"employee_code": "$emp_code"},
+                "localField": "emp_code",
+                "foreignField": "emp_code",
                 "pipeline": [
                     {
                         "$match": {
-                            "$expr": {
-                                "$and": [
-                                    {"$eq": ["$emp_code", "$$employee_code"]},
-                                    {
-                                        "$gte": [
-                                            "$date",
-                                            month_start.isoformat(),
-                                        ]
-                                    },
-                                    {
-                                        "$lte": [
-                                            "$date",
-                                            month_end.isoformat(),
-                                        ]
-                                    },
-                                ]
+                            "date": {
+                                "$gte": month_start.isoformat(),
+                                "$lte": month_end.isoformat(),
                             }
                         }
                     }
@@ -836,7 +841,12 @@ def _department_summary_pipeline(
                                     },
                                 ]
                             },
-                            "$logs.work_hours",
+                            {
+                                "$convert": {
+                                    "input": {"$toString": "$logs.work_hours"},
+                                    "to": "decimal",
+                                }
+                            },
                             0,
                         ]
                     }
@@ -941,27 +951,31 @@ def _department_summary_pipeline(
                     "$cond": [
                         {"$gt": ["$work_hours_count", 0]},
                         {
-                            "$divide": [
-                                {
-                                    "$floor": {
-                                        "$add": [
-                                            {
-                                                "$multiply": [
-                                                    {
-                                                        "$divide": [
-                                                            "$work_hours_sum",
-                                                            "$work_hours_count",
-                                                        ]
-                                                    },
-                                                    100,
-                                                ]
-                                            },
-                                            0.5,
-                                        ]
-                                    }
-                                },
-                                100,
-                            ]
+                            "$toDouble": {
+                                "$divide": [
+                                    {
+                                        "$floor": {
+                                            "$add": [
+                                                {
+                                                    "$multiply": [
+                                                        {
+                                                            "$divide": [
+                                                                "$work_hours_sum",
+                                                                {
+                                                                    "$toDecimal": "$work_hours_count"
+                                                                },
+                                                            ]
+                                                        },
+                                                        {"$toDecimal": "100"},
+                                                    ]
+                                                },
+                                                {"$toDecimal": "0.5"},
+                                            ]
+                                        }
+                                    },
+                                    {"$toDecimal": "100"},
+                                ]
+                            }
                         },
                         None,
                     ]
@@ -1111,154 +1125,227 @@ def _department_trend_pipeline(
     to_date: date,
 ) -> list[dict]:
     day_count = (to_date - from_date).days + 1
+    start_date_string = from_date.isoformat()
+    end_date_string = to_date.isoformat()
     return [
         {"$match": {"department": department}},
-        {"$limit": 1},
         {
-            "$project": {
-                "_id": 0,
-                "calendar": {
-                    "$map": {
-                        "input": {"$range": [0, day_count]},
-                        "as": "offset",
-                        "in": {
-                            "$dateAdd": {
-                                "startDate": {
-                                    "$dateFromString": {
-                                        "dateString": from_date.isoformat()
+            "$facet": {
+                "calendar": [
+                    {"$limit": 1},
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "calendar": {
+                                "$map": {
+                                    "input": {"$range": [0, day_count]},
+                                    "as": "offset",
+                                    "in": {
+                                        "$dateAdd": {
+                                            "startDate": {
+                                                "$dateFromString": {
+                                                    "dateString": start_date_string
+                                                }
+                                            },
+                                            "unit": "day",
+                                            "amount": "$$offset",
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    },
+                    {"$unwind": "$calendar"},
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "date": "$calendar",
+                            "date_string": {
+                                "$dateToString": {
+                                    "date": "$calendar",
+                                    "format": "%Y-%m-%d",
+                                }
+                            },
+                        }
+                    },
+                ],
+                "headcount_events": [
+                    {"$match": {"joined_on": {"$lte": end_date_string}}},
+                    {"$group": {"_id": "$joined_on", "headcount": {"$sum": 1}}},
+                ],
+                "attendance_events": [
+                    {
+                        "$lookup": {
+                            "from": "attendance_logs",
+                            "localField": "emp_code",
+                            "foreignField": "emp_code",
+                            "pipeline": [
+                                {
+                                    "$match": {
+                                        "date": {
+                                            "$gte": start_date_string,
+                                            "$lte": end_date_string,
+                                        }
                                     }
                                 },
-                                "unit": "day",
-                                "amount": "$$offset",
-                            }
-                        },
-                    }
-                },
+                                {
+                                    "$group": {
+                                        "_id": "$date",
+                                        "present_count": {
+                                            "$sum": {
+                                                "$cond": [
+                                                    {
+                                                        "$in": [
+                                                            "$status",
+                                                            ["PRESENT", "WFH", "ON_DUTY"],
+                                                        ]
+                                                    },
+                                                    {
+                                                        "$cond": [
+                                                            {
+                                                                "$eq": [
+                                                                    {
+                                                                        "$ifNull": [
+                                                                            "$half_day",
+                                                                            False,
+                                                                        ]
+                                                                    },
+                                                                    True,
+                                                                ]
+                                                            },
+                                                            0.5,
+                                                            1,
+                                                        ]
+                                                    },
+                                                    0,
+                                                ]
+                                            }
+                                        },
+                                        "late_count": {
+                                            "$sum": {
+                                                "$cond": [
+                                                    {
+                                                        "$gt": [
+                                                            {
+                                                                "$ifNull": [
+                                                                    "$late_minutes",
+                                                                    0,
+                                                                ]
+                                                            },
+                                                            0,
+                                                        ]
+                                                    },
+                                                    1,
+                                                    0,
+                                                ]
+                                            }
+                                        },
+                                    }
+                                },
+                            ],
+                            "as": "employee_attendance",
+                        }
+                    },
+                    {"$unwind": "$employee_attendance"},
+                    {
+                        "$group": {
+                            "_id": "$employee_attendance._id",
+                            "present_count": {
+                                "$sum": "$employee_attendance.present_count"
+                            },
+                            "late_count": {
+                                "$sum": "$employee_attendance.late_count"
+                            },
+                        }
+                    },
+                ],
+            }
+        },
+        {
+            "$project": {
+                "calendar": 1,
+                "headcount_events": 1,
+                "attendance_events": 1,
             }
         },
         {"$unwind": "$calendar"},
         {
-            "$project": {
-                "_id": 0,
-                "date": "$calendar",
-                "date_string": {
-                    "$dateToString": {
-                        "date": "$calendar",
-                        "format": "%Y-%m-%d",
-                    }
-                },
-            }
-        },
-        {
-            "$lookup": {
-                "from": "employees",
-                "let": {"report_date": "$date_string"},
-                "pipeline": [
-                    {
-                        "$match": {
-                            "$expr": {
-                                "$and": [
-                                    {"$eq": ["$department", department]},
-                                    {"$lte": ["$joined_on", "$$report_date"]},
-                                ]
-                            }
-                        }
-                    },
-                    {"$count": "headcount"},
-                ],
-                "as": "headcount_result",
-            }
-        },
-        {
-            "$lookup": {
-                "from": "attendance_logs",
-                "let": {"report_date": "$date_string"},
-                "pipeline": [
-                    {
-                        "$match": {
-                            "$expr": {"$eq": ["$date", "$$report_date"]}
-                        }
-                    },
-                    {
-                        "$lookup": {
-                            "from": "employees",
-                            "localField": "emp_code",
-                            "foreignField": "emp_code",
-                            "as": "employee",
-                        }
-                    },
-                    {"$unwind": "$employee"},
-                    {"$match": {"employee.department": department}},
-                    {
-                        "$group": {
-                            "_id": None,
-                            "present_count": {
-                                "$sum": {
-                                    "$cond": [
-                                        {
-                                            "$in": [
-                                                "$status",
-                                                ["PRESENT", "WFH", "ON_DUTY"],
-                                            ]
-                                        },
-                                        {
-                                            "$cond": [
-                                                {
-                                                    "$eq": [
-                                                        {
-                                                            "$ifNull": [
-                                                                "$half_day",
-                                                                False,
-                                                            ]
-                                                        },
-                                                        True,
-                                                    ]
-                                                },
-                                                0.5,
-                                                1,
-                                            ]
-                                        },
-                                        0,
-                                    ]
-                                }
-                            },
-                            "late_count": {
-                                "$sum": {
-                                    "$cond": [
-                                        {
-                                            "$gt": [
-                                                {"$ifNull": ["$late_minutes", 0]},
-                                                0,
-                                            ]
-                                        },
-                                        1,
-                                        0,
-                                    ]
-                                }
-                            },
-                        }
-                    },
-                ],
-                "as": "daily_attendance",
-            }
-        },
-        {
             "$addFields": {
+                "date": "$calendar.date",
+                "date_string": "$calendar.date_string",
                 "headcount": {
-                    "$ifNull": [
-                        {"$arrayElemAt": ["$headcount_result.headcount", 0]},
-                        0,
-                    ]
+                    "$sum": {
+                        "$map": {
+                            "input": {
+                                "$filter": {
+                                    "input": "$headcount_events",
+                                    "as": "event",
+                                    "cond": {
+                                        "$lte": [
+                                            "$$event._id",
+                                            "$calendar.date_string",
+                                        ]
+                                    },
+                                }
+                            },
+                            "as": "event",
+                            "in": "$$event.headcount",
+                        }
+                    }
                 },
                 "present_count": {
                     "$ifNull": [
-                        {"$arrayElemAt": ["$daily_attendance.present_count", 0]},
+                        {
+                            "$arrayElemAt": [
+                                {
+                                    "$map": {
+                                        "input": {
+                                            "$filter": {
+                                                "input": "$attendance_events",
+                                                "as": "event",
+                                                "cond": {
+                                                    "$eq": [
+                                                        "$$event._id",
+                                                        "$calendar.date_string",
+                                                    ]
+                                                },
+                                            }
+                                        },
+                                        "as": "event",
+                                        "in": "$$event.present_count",
+                                    }
+                                },
+                                0,
+                            ]
+                        },
                         0,
                     ]
                 },
                 "late_count": {
                     "$ifNull": [
-                        {"$arrayElemAt": ["$daily_attendance.late_count", 0]},
+                        {
+                            "$arrayElemAt": [
+                                {
+                                    "$map": {
+                                        "input": {
+                                            "$filter": {
+                                                "input": "$attendance_events",
+                                                "as": "event",
+                                                "cond": {
+                                                    "$eq": [
+                                                        "$$event._id",
+                                                        "$calendar.date_string",
+                                                    ]
+                                                },
+                                            }
+                                        },
+                                        "as": "event",
+                                        "in": "$$event.late_count",
+                                    }
+                                },
+                                0,
+                            ]
+                        },
                         0,
                     ]
                 },
@@ -1266,7 +1353,7 @@ def _department_trend_pipeline(
                     "$not": [
                         {
                             "$in": [
-                                {"$dayOfWeek": "$date"},
+                                {"$dayOfWeek": "$calendar.date"},
                                 [1, 7],
                             ]
                         }
@@ -1598,22 +1685,6 @@ def explain_endpoint(
     }
 
 
-@app.patch(
-    "/attendance/{emp_code}/{attendance_date}",
-    include_in_schema=False,
-)
-def correct_attendance_legacy(
-    emp_code: str,
-    attendance_date: str,
-    body: AttendanceCorrectionIn,
-):
-    return correct_attendance(
-        emp_code=emp_code,
-        date=attendance_date,
-        body=body,
-    )
-
-
 @app.patch("/attendance/{emp_code}/{date}")
 def correct_attendance(
     emp_code: str,
@@ -1816,14 +1887,3 @@ def correct_attendance(
             entry["at"] = to_epoch_milliseconds(entry["at"])
 
     return updated_record
-
-
-# --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   PATCH /attendance/{emp_code}/{date}
-#   GET   /analytics/employees/{emp_code}/monthly
-#   GET   /analytics/departments/summary
-#   GET   /analytics/leaderboard/late
-#   GET   /analytics/departments/{department}/trend
-#   GET   /admin/explain/{endpoint}
-# --------------------------------------------------------------------------- #

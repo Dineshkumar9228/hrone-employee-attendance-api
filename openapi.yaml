@@ -158,8 +158,8 @@ paths:
       summary: Record a punch-in
       description: |
         Creates the day's record. `date` follows R1 and `late_minutes` follows R2; `punch_out` and `work_hours` start as
-        `null`, `overtime_minutes` as 0, `half_day` as false, `history` as `[]`. If `punched_at` is omitted, use the
-        current time. `status` defaults to `PRESENT`; only `PRESENT`, `WFH` and `ON_DUTY` are accepted here.
+        `null`, `overtime_minutes` as 0, `half_day` as false, `history` as `[]`. If `punched_at` is omitted or null, use
+        the current time. `status` defaults to `PRESENT`; only `PRESENT`, `WFH` and `ON_DUTY` are accepted here.
         **Concurrency:** if the same employee punches in twice for the same attendance date at the same moment,
         exactly one request gets 201 and the rest get 409. Do not rely on check-then-insert.
         Errors: 404 unknown employee; 409 already punched in for that date; 422 invalid body.
@@ -512,8 +512,8 @@ components:
         emp_code: {type: string}
         punched_at:
           allOf:
-            - {$ref: '#/components/schemas/EpochMillis'}
-          description: Epoch milliseconds. Defaults to now.
+            - {$ref: '#/components/schemas/EpochMillisNullable'}
+          description: Epoch milliseconds, or null. Defaults to now when omitted or null.
         status:
           allOf:
             - {$ref: '#/components/schemas/PresenceStatus'}
@@ -525,8 +525,8 @@ components:
         emp_code: {type: string}
         punched_at:
           allOf:
-            - {$ref: '#/components/schemas/EpochMillis'}
-          description: Epoch milliseconds. Defaults to now.
+            - {$ref: '#/components/schemas/EpochMillisNullable'}
+          description: Epoch milliseconds, or null. Defaults to now when omitted or null.
     RegularizeRequest:
       type: object
       required: [reason, regularized_by]

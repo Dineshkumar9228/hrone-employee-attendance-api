@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 
 from test_attendance_sprint2 import AttendanceSprint2Tests, main
 
@@ -277,9 +278,11 @@ class DepartmentSummaryTests(AttendanceSprint2Tests):
         )
         self.assertEqual(pipeline[1]["$lookup"]["from"], "attendance_logs")
         self.assertEqual(
-            pipeline[1]["$lookup"]["pipeline"][0]["$match"]["$expr"]["$and"][1],
-            {"$gte": ["$date", "2026-01-01"]},
+            pipeline[1]["$lookup"]["pipeline"][0]["$match"],
+            {"date": {"$gte": "2026-01-01", "$lte": "2026-01-31"}},
         )
+        self.assertEqual(pipeline[1]["$lookup"]["localField"], "emp_code")
+        self.assertEqual(pipeline[1]["$lookup"]["foreignField"], "emp_code")
 
     def test_department_filter_is_exact_and_applied_in_aggregation(self):
         self.add_employee(department="Engineering")
@@ -344,6 +347,29 @@ class DepartmentSummaryTests(AttendanceSprint2Tests):
         self.assertEqual(
             response.json()["items"][0]["avg_work_hours"],
             1.13,
+        )
+
+    def test_average_work_hours_uses_decimal_half_up_at_binary_float_boundary(self):
+        self.add_employee(department="People")
+        self.add_record(
+            "EMP0001",
+            "2026-01-05",
+            "PRESENT",
+            work_hours=1.0,
+        )
+        self.add_record(
+            "EMP0001",
+            "2026-01-06",
+            "PRESENT",
+            work_hours=1.01,
+        )
+
+        response = self.summary(department="People")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json()["items"][0]["avg_work_hours"],
+            1.01,
         )
 
     def test_employees_joining_after_month_are_excluded(self):
@@ -559,6 +585,41 @@ class DepartmentTrendTests(DepartmentSummaryTests):
         self.assertEqual(items[7]["moving_avg_7d"], 0.0)
         self.assertFalse(items[5]["is_working_day"])
         self.assertEqual(items[2]["headcount"], 2)
+
+    def test_trend_counts_department_attendance_before_employee_join_date(self):
+        self.add_employee(joined_on="2026-01-06", department="Engineering")
+        self.add_attendance("EMP0001", "2026-01-05", "PRESENT")
+
+        response = self.trend(start="2026-01-05", end="2026-01-06")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        items = response.json()["items"]
+        self.assertEqual(items[0]["present_count"], 1)
+        self.assertEqual(items[0]["headcount"], 0)
+        self.assertIsNone(items[0]["attendance_rate"])
+        self.assertEqual(items[1]["headcount"], 1)
+
+    def test_trend_pipeline_uses_one_employee_to_attendance_lookup(self):
+        pipeline = main._department_trend_pipeline(
+            "Engineering",
+            date(2026, 1, 1),
+            date(2026, 1, 20),
+        )
+        facets = pipeline[1]["$facet"]
+        attendance_lookups = [
+            stage["$lookup"]
+            for stage in facets["attendance_events"]
+            if "$lookup" in stage
+        ]
+
+        self.assertEqual(len(facets["calendar"]), 4)
+        self.assertEqual(len(attendance_lookups), 1)
+        self.assertEqual(attendance_lookups[0]["from"], "attendance_logs")
+        self.assertEqual(attendance_lookups[0]["localField"], "emp_code")
+        self.assertEqual(attendance_lookups[0]["foreignField"], "emp_code")
+        self.assertFalse(
+            any("$lookup" in stage for stage in facets["headcount_events"])
+        )
 
     def test_trend_returns_zero_rate_for_empty_workday_and_null_for_zero_headcount(self):
         self.add_employee(joined_on="2026-01-05", department="Engineering")

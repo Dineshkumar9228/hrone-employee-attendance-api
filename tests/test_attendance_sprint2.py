@@ -7,7 +7,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import ConnectionFailure, DuplicateKeyError
 
 from app import main
 
@@ -28,9 +28,9 @@ class FakeCursor:
     def __init__(self, documents):
         self.documents = documents
 
-    def sort(self, keys):
+    def sort(self, keys, direction=1):
         if isinstance(keys, str):
-            keys = [(keys, 1)]
+            keys = [(keys, direction)]
         for field, direction in reversed(keys):
             self.documents.sort(
                 key=lambda document: document.get(field),
@@ -503,6 +503,129 @@ class AttendanceSprint2Tests(unittest.TestCase):
         self.assertIsNone(body["punch_out"])
         self.assertNotIn("id", body)
         self.assertNotIn("_id", body)
+
+    def test_list_responses_serialize_top_level_and_history_timestamps(self):
+        self.add_employee()
+        created_at = datetime(2026, 1, 5, 4, 30, 0, 456000, tzinfo=UTC)
+        main.db.employees.documents[0]["created_at"] = created_at
+
+        employee_response = self.client.get("/employees")
+
+        self.assertEqual(employee_response.status_code, 200)
+        self.assertEqual(
+            employee_response.json()["items"][0]["created_at"],
+            epoch_ms(created_at.replace(microsecond=0)),
+        )
+
+        punch_in = at_ist(5, 9, 30)
+        punch_out = at_ist(5, 18, 30)
+        corrected_punch_in = at_ist(5, 9, 35)
+        history_at = at_ist(6, 12, 0)
+        main.db.attendance_logs.insert_one(
+            {
+                "emp_code": "EMP0001",
+                "date": "2026-01-05",
+                "status": "PRESENT",
+                "punch_in": punch_in,
+                "punch_out": punch_out,
+                "work_hours": 9.0,
+                "late_minutes": 0,
+                "overtime_minutes": 0,
+                "half_day": False,
+                "history": [
+                    {
+                        "at": history_at,
+                        "by": "manager",
+                        "reason": "Correction",
+                        "changes": {
+                            "punch_in": {
+                                "from": punch_in,
+                                "to": corrected_punch_in,
+                            },
+                            "punch_out": {
+                                "from": punch_out,
+                                "to": None,
+                            },
+                        },
+                    }
+                ],
+            }
+        )
+
+        attendance_response = self.client.get("/attendance")
+
+        self.assertEqual(attendance_response.status_code, 200)
+        record = attendance_response.json()["items"][0]
+        self.assertEqual(record["punch_in"], epoch_ms(punch_in))
+        self.assertEqual(record["punch_out"], epoch_ms(punch_out))
+        self.assertEqual(record["history"][0]["at"], epoch_ms(history_at))
+        self.assertEqual(
+            record["history"][0]["changes"],
+            {
+                "punch_in": {
+                    "from": epoch_ms(punch_in),
+                    "to": epoch_ms(corrected_punch_in),
+                },
+                "punch_out": {
+                    "from": epoch_ms(punch_out),
+                    "to": None,
+                },
+            },
+        )
+
+    def test_employee_creation_stores_and_returns_whole_second_timestamp(self):
+        response = self.client.post(
+            "/employees",
+            json={
+                "emp_code": "EMP0001",
+                "name": "Test Employee",
+                "email": "test@example.com",
+                "department": "Engineering",
+                "joined_on": "2026-01-05",
+            },
+        )
+
+        self.assertEqual(response.status_code, 201, response.text)
+        created_at = response.json()["created_at"]
+        stored = main.db.employees.find_one({"emp_code": "EMP0001"})
+        self.assertIsInstance(created_at, int)
+        self.assertEqual(created_at % 1000, 0)
+        self.assertEqual(stored["created_at"].microsecond, 0)
+
+    def test_health_returns_503_when_mongodb_ping_fails(self):
+        with patch.object(
+            main.db,
+            "command",
+            side_effect=ConnectionFailure("MongoDB unavailable"),
+        ):
+            response = self.client.get("/health")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "MongoDB is unavailable")
+
+    def test_startup_defers_indexes_until_mongodb_responds(self):
+        original_create_index = main.db.employees.create_index
+        first_attempt = True
+
+        def fail_once(*args, **kwargs):
+            nonlocal first_attempt
+            if first_attempt:
+                first_attempt = False
+                raise ConnectionFailure("MongoDB unavailable")
+            return original_create_index(*args, **kwargs)
+
+        with patch.object(main, "_indexes_created", False):
+            with patch.object(
+                main.db.employees,
+                "create_index",
+                side_effect=fail_once,
+            ):
+                with TestClient(main.app) as client:
+                    self.assertFalse(main._indexes_created)
+                    response = client.get("/health")
+
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(main._indexes_created)
 
     def test_punch_endpoints_reject_coercible_non_integer_timestamps(self):
         self.add_employee()

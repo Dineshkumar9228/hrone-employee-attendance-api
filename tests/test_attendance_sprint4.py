@@ -92,7 +92,7 @@ class AttendanceSprint4MonthlyTests(AttendanceSprint2Tests):
         body = response.json()
         self.assertEqual(body["working_days"], 12)
         self.assertEqual(body["present_days"], 1)
-        self.assertEqual(body["attendance_pct"], 8.33)
+        self.assertEqual(body["attendance_pct"], 8.3333)
 
     def test_monthly_summary_empty_result_and_zero_working_days(self):
         self.add_employee(joined_on="2026-01-31")

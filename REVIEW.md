@@ -2,7 +2,7 @@
 
 ## Verified Defect Review
 
-Rows 1-7 record the starter defects traced in the original implementation. Rows 8-13 record additional contract and
+Rows 1-7 record the starter defects traced in the original implementation. Rows 8-16 record additional contract and
 performance defects reproduced during follow-up review, with their fixes and verification evidence.
 
 | # | Where (function / line) | What is wrong | How you'd notice it (test, input, or symptom) | How you fixed it |
@@ -20,8 +20,11 @@ performance defects reproduced during follow-up review, with their fixes and ver
 | 11 | Department-summary attendance lookup | The lookup expressed both the employee-code equality and literal month bounds inside `$expr`. A focused A/B probe on the 5,000-employee/100,000-record benchmark database returned identical rows but measured 6.539/7.118 s for the original form versus 5.402/4.977 s for a direct equality join and date match. | Compare both aggregation results and timings on `hrone_attendance_perf_20261013`; the paired timings favor the direct form, but require a repeatable final benchmark. | Use `localField`/`foreignField` for `emp_code` and a direct inclusive `date` range predicate. The existing unique `(emp_code, date)` index remains in use; no index was added. |
 | 12 | Department-trend repeated lookups | The prior pipeline performed a headcount lookup per day and an attendance lookup per day that joined each attendance row back to employees. On the benchmark dataset, the previous pipeline took 29.644 s; the revised pipeline took 0.979/1.027/0.975 s and returned rows exactly equal to the previous output. | Run both pipeline versions for Engineering, 2026-01-01 through 2026-01-20, and compare the 20 output rows and elapsed times. | Compute headcount and attendance event arrays once per department in a `$facet`, join attendance from department employees through the existing employee-code index, and retain the calendar and moving-window calculations. Repeat the benchmark before treating these measurements as final. |
 | 13 | Department-summary average rounding | Rounding an average in binary floating-point could turn the exact decimal midpoint `1.005` into `1.00` instead of half-up `1.01`. A MongoDB expression using the old formula reproduced this result for `1.00` and `1.01`. | Exercise that midpoint in the live MongoDB expression and in the focused summary regression test. | Sum work-hour values as Decimal128, perform the average and half-up rounding in decimal arithmetic, and convert only the final rounded result to double. |
+| 14 | Employee and attendance response timestamps | Employee and attendance listing responses exposed BSON datetimes as ISO strings; nested BSON history timestamps had the same issue. Employee creation also retained sub-second precision despite R1. | Seed whole and fractional BSON datetimes in the fake database and inspect employee/attendance list responses; create an employee and inspect the stored instant. | Serialize employee and attendance response paths as epoch milliseconds, convert nested history timestamps, and truncate server-generated creation times to whole seconds. Added focused regression tests. |
+| 15 | Startup readiness while MongoDB is unavailable | Index creation ran unconditionally during startup, so a MongoDB connection failure prevented the server from serving the documented `/health` 503 response. | Inject `ConnectionFailure` into index creation during startup and request health using the in-memory fake. | Defer index initialization on connection failure, log the failure, and retry initialization after a successful health ping. Added fake-only startup and health tests; no outage was induced against a real database. |
+| 16 | Employee monthly attendance rate precision | `attendance_pct` was rounded to two decimals even though R8 requires four decimal places for rates. | A mid-month join test with one present day out of 12 working days returned `8.33` rather than `8.3333`. | Use decimal half-up rounding to four decimal places and update the focused regression expectation. |
 
-**Review scope note:** The table records thirteen verified defects and their fixes; it is not a claim that every line of the original starter file has been audited. Add further rows only when the defect, reproduction case, and fix have been verified.
+**Review scope note:** The table records sixteen verified defects and their fixes; it is not a claim that every line of the original starter file has been audited. Add further rows only when the defect, reproduction case, and fix have been verified.
 
 ## Items Reviewed but Not Classified as Defects
 
@@ -101,7 +104,7 @@ performance defects reproduced during follow-up review, with their fixes and ver
 
 - Added `GET /analytics/employees/{emp_code}/monthly` with required `month=YYYY-MM` validation, HTTP 404 for an unknown employee, and the `EmployeeMonthly` response fields from `openapi.yaml`.
 - Uses an indexed employee/date range `$match` and a MongoDB `$group` aggregation over stored attendance values. The aggregation counts presence only on weekdays, applies the stored half-day flag as 0.5, and returns leave, late, and overtime totals; missing derived values default to zero.
-- Counts Monday-Friday working days inclusively from the later of the month's first day and the employee's `joined_on`. `attendance_pct` uses half-up rounding to two decimals and is `null` when working days are zero.
+- Counts Monday-Friday working days inclusively from the later of the month's first day and the employee's `joined_on`. `attendance_pct` uses half-up rounding to four decimals and is `null` when working days are zero.
 
 ### Tests Actually Passed
 
@@ -149,6 +152,11 @@ performance defects reproduced during follow-up review, with their fixes and ver
 
 ## Follow-up Verification — 13 October 2026
 
+See [BENCHMARK_REPORT.md](./BENCHMARK_REPORT.md) for a consolidated account of
+the recorded benchmark measurements, query-plan findings, and missing
+parameters. The measurements below remain preliminary and were not rerun
+during finalization.
+
 - Ran focused unittest cases covering punch timestamp strictness and response fields, attendance status validation and pagination, IST/overnight behavior, grace/overtime/half-day/rounding boundaries, department summary headcount and aggregation behavior, department trend rows and moving averages, and explain-pipeline construction: **20 passed, 0 failed**.
 - Compared the 12 path/method pairs in `openapi.yaml` with FastAPI's generated OpenAPI map: the sets match exactly. Examples and response schemas were reviewed against the endpoint behavior; the timestamp and punch-in response mismatches recorded above were corrected.
 - On the read-only `hrone_attendance_perf_20261013` database (5,000 employees, 100,000 attendance records), MongoDB 8.2.1 explain output for attendance listing, employee monthly, department summary, leaderboard, and department trend reported zero collection scans. The observed indexes were `idx_attendance_date_code`, `uq_attendance_employee_date`, `idx_employee_joined_on`, `uq_employee_emp_code`, and `idx_employee_department_code` as applicable. No indexes were created or dropped.
@@ -156,3 +164,12 @@ performance defects reproduced during follow-up review, with their fixes and ver
 - The decimal summary expression returned 1.01 for a synthetic average of 1.00 and 1.01, and the complete aggregation returned the expected five departments and 9.0 average hours on the benchmark dataset. The Decimal128 change was made after the A/B timing probe, so the final combined summary pipeline still needs a benchmark.
 - The trend comparison returned identical 20-row output; measured 29.644 s for the previous pipeline and 0.979/1.027/0.975 s for the revised pipeline. Repeat with the full benchmark procedure before treating this as the final performance result.
 - Final benchmark, full regression suite, and human Git review remain manual verification steps.
+
+## Finalization Verification — 14 October 2026
+
+- `python -m pytest -q`: **253 passed, 88 subtests passed**, with the two existing FastAPI startup-event deprecation warnings.
+- Focused timestamp, startup/readiness, and monthly-rate regressions: **29 passed**.
+- `python -m py_compile app\main.py`, `git diff --check`, dependency installation from `requirements-dev.txt`, and `pip check` completed successfully.
+- The generated FastAPI route map matched all 12 path/method pairs in `openapi.yaml`.
+- A temporary server on port 8000 returned HTTP 200 for `/docs`, `/openapi.json`, and `/health`. Lifespan was disabled to avoid creating indexes in the original database; health performed a ping only. The temporary server was stopped.
+- No final benchmark or execution-plan query was run. See [BENCHMARK_REPORT.md](./BENCHMARK_REPORT.md) for recorded evidence and its limits.

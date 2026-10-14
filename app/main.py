@@ -10,6 +10,7 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import calendar
 import json
+import logging
 import os
 import re
 from datetime import date, datetime, timedelta, timezone
@@ -20,7 +21,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 from pymongo import MongoClient
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import ConnectionFailure, DuplicateKeyError, PyMongoError
 
 load_dotenv()
 
@@ -33,36 +34,50 @@ db = client[os.getenv("MONGO_DB", "hrone_attendance")]
 IST = timezone(timedelta(hours=5, minutes=30))
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+logger = logging.getLogger(__name__)
+_indexes_created = False
+
+
 @app.on_event("startup")
 def create_indexes():
-    # Employee indexes
-    db.employees.create_index(
-        [("emp_code", 1)],
-        unique=True,
-        name="uq_employee_emp_code",
-    )
+    global _indexes_created
+    try:
+        # Employee indexes
+        db.employees.create_index(
+            [("emp_code", 1)],
+            unique=True,
+            name="uq_employee_emp_code",
+        )
 
-    db.employees.create_index(
-        [("department", 1), ("emp_code", 1)],
-        name="idx_employee_department_code",
-    )
+        db.employees.create_index(
+            [("department", 1), ("emp_code", 1)],
+            name="idx_employee_department_code",
+        )
 
-    db.employees.create_index(
-        [("joined_on", 1)],
-        name="idx_employee_joined_on",
-    )
+        db.employees.create_index(
+            [("joined_on", 1)],
+            name="idx_employee_joined_on",
+        )
 
-    # Attendance indexes
-    db.attendance_logs.create_index(
-        [("emp_code", 1), ("date", 1)],
-        unique=True,
-        name="uq_attendance_employee_date",
-    )
+        # Attendance indexes
+        db.attendance_logs.create_index(
+            [("emp_code", 1), ("date", 1)],
+            unique=True,
+            name="uq_attendance_employee_date",
+        )
 
-    db.attendance_logs.create_index(
-        [("date", -1), ("emp_code", 1)],
-        name="idx_attendance_date_code",
-    )
+        db.attendance_logs.create_index(
+            [("date", -1), ("emp_code", 1)],
+            name="idx_attendance_date_code",
+        )
+    except ConnectionFailure:
+        logger.warning(
+            "MongoDB unavailable during startup; index creation is deferred",
+            exc_info=True,
+        )
+        return
+
+    _indexes_created = True
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -166,6 +181,52 @@ def epoch_milliseconds_to_utc(value: int) -> datetime:
 
 def to_epoch_milliseconds(value: datetime) -> int:
     return int(normalize_utc(value).timestamp()) * 1000
+
+
+def _employee_api_record(record: dict) -> dict:
+    response = dict(record)
+    response.pop("_id", None)
+    created_at = response.get("created_at")
+    if isinstance(created_at, datetime):
+        response["created_at"] = to_epoch_milliseconds(created_at)
+    return response
+
+
+def _attendance_api_record(record: dict) -> dict:
+    response = dict(record)
+    response.pop("_id", None)
+
+    for field in ("punch_in", "punch_out"):
+        if isinstance(response.get(field), datetime):
+            response[field] = to_epoch_milliseconds(response[field])
+
+    history = response.get("history", [])
+    response["history"] = [
+        dict(entry) if isinstance(entry, dict) else entry
+        for entry in history
+    ]
+    for entry in response["history"]:
+        if not isinstance(entry, dict):
+            continue
+        if isinstance(entry.get("at"), datetime):
+            entry["at"] = to_epoch_milliseconds(entry["at"])
+
+        changes = entry.get("changes")
+        if not isinstance(changes, dict):
+            continue
+        for field in ("punch_in", "punch_out"):
+            change = changes.get(field)
+            if not isinstance(change, dict):
+                continue
+            change = dict(change)
+            for direction in ("from", "to"):
+                if isinstance(change.get(direction), datetime):
+                    change[direction] = to_epoch_milliseconds(
+                        change[direction]
+                    )
+            changes[field] = change
+
+    return response
 
 
 # --------------------------------------------------------------------------- #
@@ -284,19 +345,26 @@ class AttendanceCorrectionIn(BaseModel):
 def health():
     try:
         db.command("ping")
-        return {"status": "ok"}
-    except Exception:
+        if not _indexes_created:
+            create_indexes()
+            if not _indexes_created:
+                raise HTTPException(
+                    status_code=503,
+                    detail="MongoDB is unavailable",
+                )
+    except PyMongoError:
         raise HTTPException(
             status_code=503,
             detail="MongoDB is unavailable",
         )
+    return {"status": "ok"}
 
 
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
     doc = body.model_dump()
-    doc["created_at"] = datetime.now(timezone.utc)
+    doc["created_at"] = utc_now()
 
     try:
         db.employees.insert_one(doc)
@@ -307,7 +375,7 @@ def create_employee(body: EmployeeIn):
         )
 
     doc.pop("_id", None)
-    doc["created_at"] = int(doc["created_at"].timestamp() * 1000)
+    doc["created_at"] = to_epoch_milliseconds(doc["created_at"])
 
     return doc
 
@@ -332,12 +400,13 @@ def list_employees(
     skip = (page - 1) * page_size
     total = db.employees.count_documents(q)
 
-    items = list(
+    items = (
         db.employees.find(q, {"_id": 0})
         .sort("emp_code", 1)
         .skip(skip)
         .limit(page_size)
     )
+    items = [_employee_api_record(item) for item in items]
 
     return {
         "items": items,
@@ -399,12 +468,7 @@ def punch_in(body: PunchInIn):
             detail="Already punched in for this attendance date",
         )
 
-    doc.pop("_id", None)
-
-    # Return timestamps as epoch milliseconds.
-    doc["punch_in"] = int(ts.timestamp() * 1000)
-
-    return doc
+    return _attendance_api_record(doc)
 
 @app.post("/attendance/punch-out")
 def punch_out(body: PunchOutIn):
@@ -501,14 +565,12 @@ def punch_out(body: PunchOutIn):
         )
 
     # Return API timestamps as epoch milliseconds.
-    record["punch_in"] = to_epoch_milliseconds(punch_in_time)
-    record["punch_out"] = to_epoch_milliseconds(ts)
+    record["punch_in"] = punch_in_time
+    record["punch_out"] = ts
     record["work_hours"] = work_hours
     record["overtime_minutes"] = overtime
     record["half_day"] = half_day
-    record.pop("_id", None)
-
-    return record
+    return _attendance_api_record(record)
 
 
 @app.get("/attendance")
@@ -576,7 +638,7 @@ def list_attendance(
         .limit(page_size)
     )
 
-    items = list(cursor)
+    items = [_attendance_api_record(item) for item in cursor]
 
     return {
         "items": items,
@@ -723,7 +785,7 @@ def employee_monthly(emp_code: str, month: str):
     if working_days:
         attendance_pct = float(
             (Decimal(str(present_days)) * Decimal(100) / Decimal(working_days))
-            .quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            .quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
         )
 
     return {
@@ -1876,14 +1938,4 @@ def correct_attendance(
         {"_id": 0},
     )
 
-    for field in ("punch_in", "punch_out"):
-        if updated_record.get(field) is not None:
-            updated_record[field] = to_epoch_milliseconds(
-                updated_record[field]
-            )
-
-    for entry in updated_record.get("history", []):
-        if isinstance(entry.get("at"), datetime):
-            entry["at"] = to_epoch_milliseconds(entry["at"])
-
-    return updated_record
+    return _attendance_api_record(updated_record)

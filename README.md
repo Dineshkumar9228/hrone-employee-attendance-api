@@ -37,7 +37,7 @@ A REST API built with **FastAPI** and **MongoDB** for employee management, atten
 
 ## Prerequisites
 
-- Python 3.10 or newer
+- Python 3.11 or newer
 - MongoDB 6.0 or newer
 - Git
 

@@ -456,6 +456,9 @@ class AttendanceSprint2Tests(unittest.TestCase):
         self.client.__exit__(None, None, None)
         main.db = self.original_db
 
+    def test_mongodb_server_selection_timeout_is_bounded(self):
+        self.assertEqual(main.client.options.server_selection_timeout, 5)
+
     def add_employee(
         self,
         emp_code="EMP0001",

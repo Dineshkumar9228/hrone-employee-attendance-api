@@ -28,6 +28,7 @@ load_dotenv()
 client = MongoClient(
     os.getenv("MONGO_URI", "mongodb://localhost:27017"),
     tz_aware=True,
+    serverSelectionTimeoutMS=5000,
 )
 db = client[os.getenv("MONGO_DB", "hrone_attendance")]
 
@@ -324,7 +325,9 @@ class AttendanceCorrectionIn(BaseModel):
     @field_validator("status")
     @classmethod
     def validate_status(cls, value):
-        if value is not None and value not in {
+        if value is None:
+            raise ValueError("status cannot be null")
+        if value not in {
             "PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"
         }:
             raise ValueError("Invalid attendance status")

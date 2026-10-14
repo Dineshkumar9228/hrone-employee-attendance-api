@@ -75,6 +75,19 @@ class AttendanceSprint3Tests(AttendanceSprint2Tests):
         response = self.correct(status="INVALID")
         self.assertEqual(response.status_code, 422)
 
+    def test_explicit_null_status_returns_422_without_mutation(self):
+        self.add_employee()
+        self.punch_in(at_ist(5, 9, 30))
+
+        response = self.correct(status=None)
+
+        self.assertEqual(response.status_code, 422)
+        stored = main.db.attendance_logs.find_one(
+            {"emp_code": "EMP0001", "date": "2026-01-05"}
+        )
+        self.assertEqual(stored["status"], "PRESENT")
+        self.assertEqual(stored["history"], [])
+
     def test_explicit_null_punch_timestamp_returns_422(self):
         self.add_employee()
         self.punch_in(at_ist(5, 9, 30))
